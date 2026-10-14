@@ -1,0 +1,83 @@
+# Publish the ROUTE+ preview to GitHub Pages.
+#
+# The site is three static files at the repository root, so there is nothing to
+# build: the job uploads the root as-is. `.nojekyll` is in the repo so Pages
+# serves the files verbatim instead of running them through Jekyll.
+#
+# Before the first run: Settings -> Pages -> Build and deployment -> Source:
+# "GitHub Actions". Without that, this workflow runs and the deploy step fails.
+name: Deploy preview to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: read the repo, write Pages, and mint the OIDC token the
+# deploy action exchanges. Nothing else.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push supersedes an in-flight one rather
+# than queueing behind it.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # A failed check here is the whole point: this repository is public, so
+      # anything private that reaches it is published. The build is a single
+      # self-contained HTML file and must stay that way.
+      - name: Refuse to publish secrets or backend files
+        run: |
+          set -eu
+          fail=0
+          for f in .env .env.production .env.local; do
+            [ -e "$f" ] && { echo "::error::$f must never be in the preview repo"; fail=1; }
+          done
+          if find . -path ./.git -prune -o \
+                    \( -name '*.sqlite*' -o -name '*.dump' -o -name '*.dump.json' \) -print \
+             | grep -q .; then
+            echo "::error::a database file or dump is present"; fail=1
+          fi
+          for d in server shared scripts tests; do
+            [ -d "$d" ] && { echo "::error::backend directory '$d' must not be in the preview repo"; fail=1; }
+          done
+          if grep -rIlE 'AIza[0-9A-Za-z_-]{20,}' --exclude-dir=.git . | grep -q .; then
+            echo "::error::a Google API key shape was found"; fail=1
+          fi
+          if grep -rIlE 'postgres(ql)?://[^"'"'"' ]*:[^"'"'"' ]*@' --exclude-dir=.git . | grep -q .; then
+            echo "::error::a database connection string with credentials was found"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "clean: no secrets, no databases, no backend directories"
+
+      - name: Check the page is self-contained
+        run: |
+          set -eu
+          test -f index.html
+          # Nothing may be fetched from another origin at load time: no external
+          # <script src> and no external stylesheet. Inline only.
+          if grep -oE '<script[^>]+src=|<link[^>]+rel="stylesheet"' index.html | grep -q .; then
+            echo "::error::index.html loads an external script or stylesheet"; exit 1
+          fi
+          bytes=$(wc -c < index.html)
+          echo "index.html is $bytes bytes, self-contained"
+          [ "$bytes" -gt 100000 ] || { echo "::error::index.html looks truncated"; exit 1; }
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4
